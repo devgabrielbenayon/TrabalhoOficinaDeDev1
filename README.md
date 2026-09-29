@@ -44,19 +44,9 @@ Ajudar o departamento de scouting de um clube a encontrar jogadores que ele **ai
 
 Os dois são baixados automaticamente com `kagglehub`, sem precisar de login.
 
-**Por que a temporada 2024/25?** Em **20/01/2026** a Opta encerrou o fornecimento de dados avançados ao FBref ([anúncio](https://www.sports-reference.com/blog/2026/01/fbref-stathead-data-update/)). Com isso, xG, passes progressivos e SCA deixaram de ser atualizados. A 2024/25 é a última temporada completa com esses dados, e o script confirma que as colunas estão 100% preenchidas.
+**Por que a temporada 2024/25?** Em **20/01/2026** a Opta encerrou o fornecimento de dados avançados ao FBref. Com isso, xG, passes progressivos e SCA deixaram de ser atualizados. A 2024/25 é a última temporada completa com esses dados, e o script confirma que as colunas estão 100% preenchidas.
 
-### 3.2 Outras fontes (e por que não foram usadas)
-
-| Fonte | Acesso | Cobertura / limitação |
-|---|---|---|
-| StatsBomb Open Data (`statsbombpy`) | grátis, oficial | dados de eventos completos, mas só algumas competições e temporadas (Copas, Euros, temporadas avulsas) |
-| FBref via `soccerdata` / `worldfootballR` | scraping | muitas ligas (incl. Brasileirão), mas **sem dados avançados desde jan/2026**, com limite de requisições e termos de uso |
-| Understat (`soccerdata`, `understatapi`) | scraping | xG/xA de 6 ligas desde 2014/15; quase nada defensivo |
-| WhoScored / Sofascore / FotMob | APIs não oficiais | amplos, mas instáveis e contrários aos termos de uso |
-| Opta, Wyscout, StatsBomb (pago) | comercial | cobertura global, incluindo Brasileirão; caro |
-
-### 3.3 Preparação ([src/data.py](src/data.py), [src/matching.py](src/matching.py))
+### 3.2 Preparação ([src/data.py](src/data.py), [src/matching.py](src/matching.py))
 
 1. **FBref:** 152 jogadores trocaram de clube durante a temporada e têm uma linha por clube. As contagens são somadas, e o resultado são 2.699 jogadores. A coluna `Blocks` do CSV é de *passes bloqueados*; os bloqueios defensivos estão em `Blocks_stats_defense`.
 2. **Cruzamento FBref ↔ Transfermarkt:** os dois sites não compartilham IDs, então o cruzamento é feito em 3 etapas:
@@ -71,21 +61,7 @@ Os dois são baixados automaticamente com `kagglehub`, sem precisar de login.
 
 ## 4. Método
 
-### 4.1 Mapeamento do domínio (filmes → futebol)
-
-O projeto começou como um recomendador de filmes (MovieLens). A arquitetura foi mantida e o domínio trocado:
-
-| Filmes | Futebol |
-|---|---|
-| usuário | clube (`club_id`) |
-| filme | jogador (`player_id`) |
-| nota 0,5–5 (explícita) | peso implícito por minutos e recência |
-| gêneros do filme | vetor de métricas por 90 (conteúdo) |
-| ≥ 5 avaliações por filme | ≥ 900 minutos |
-| usuário avalia filme na interface | olheiro adiciona à **shortlist** (interesse 1–5), aplicada por *fold-in* |
-| excluir filmes já vistos | excluir jogadores que já passaram pelo clube |
-
-### 4.2 Pipeline do KNN por métricas ([src/features.py](src/features.py))
+### 4.1 Pipeline do KNN por métricas ([src/features.py](src/features.py))
 
 1. **Corte de minutos:** o pool tem ≥ 900 min. O jogador de referência entra mesmo abaixo do corte, com um aviso de "amostra pequena". Sem esse corte, alguém com 90 min e 1 gol teria 1 gol/90 e distorceria os vizinhos.
 2. **Por 90 minutos:** `contagem / (minutos / 90)`, para que minutos jogados não definam a similaridade.
@@ -114,7 +90,7 @@ Para incluir o Brasileirão, basta acrescentar os dados e o fator da liga em [sr
 
 **Distância:** euclidiana (padrão; considera perfil **e** intensidade) ou cosseno (só perfil: um jogador "igual, mas em menor volume" fica próximo).
 
-### 4.3 Camada de decisão + KNN ([src/scouting.py](src/scouting.py))
+### 4.2 Camada de decisão + KNN ([src/scouting.py](src/scouting.py))
 
 ```python
 from src.data import build_players
@@ -129,7 +105,7 @@ ranking, X, Zw = find_similar(players, ref, n=10, filt=filt)
 
 A `ScoutFilter` elimina candidatos **antes** do `NearestNeighbors`. O top X% é calculado sobre o grupo inteiro, não só sobre quem sobrou. `similaridade_%` indica de quantos % do grupo o candidato está mais perto do que o resto ("mais parecido que 99% dos volantes").
 
-### 4.4 Filtragem colaborativa e híbrido ([src/models.py](src/models.py))
+### 4.3 Filtragem colaborativa e híbrido ([src/models.py](src/models.py))
 
 Todos os modelos compartilham `recommend(linha_do_clube, k)`. Os jogadores que já passaram pelo clube e os que estão fora do universo scoutável ou dos filtros recebem −∞, e a avaliação confere isso com um `assert`.
 
@@ -139,7 +115,7 @@ Todos os modelos compartilham `recommend(linha_do_clube, k)`. Os jogadores que j
 - **Conteúdo:** proximidade entre o vetor de métricas do candidato e o **perfil médio dos jogadores do histórico do clube** na mesma posição, ponderado pelo peso na matriz. Por usar só dados anteriores ao corte, não há vazamento, e a shortlist desloca esse perfil.
 - **Híbrido:** 0,75·Item-KNN + 0,25·Conteúdo.
 
-### 4.5 Protocolo de avaliação ([src/evaluate.py](src/evaluate.py))
+### 4.4 Protocolo de avaliação ([src/evaluate.py](src/evaluate.py))
 
 - **Divisão temporal**, que é a situação real do scouting: o modelo vê o passado e tenta prever o futuro.
   - **Treino:** aparições antes de **01/07/2025**.
@@ -232,24 +208,15 @@ A interface usa todos os dados até jul/2026. A avaliação usa o corte de 01/07
 
 - **Só as 5 grandes ligas e só 2024/25** no conteúdo (limite do dataset e do fim dos dados Opta no FBref). Contratações vindas de outras ligas (Portugal, Holanda, Brasil) não podem ser recomendadas: só cerca de 24% das chegadas aos clubes das 5 grandes ligas vieram do universo scoutável.
 - **Métricas de uma única temporada**, sem tendência nem histórico de lesões.
-- **Sem ajuste por posse de bola.** Times com pouca posse inflam métricas defensivas. O FBref não traz a posse do time no CSV de jogadores.
-- **Cruzamento por nome** (99,7%): poucos erros possíveis entre homônimos da base.
+- **Sem ajuste por posse de bola.** Times com pouca posse inflam métricas defensivas.
 - **Matriz muito esparsa** (99,8%), porque cada jogador passa por poucos clubes. Jogadores de clubes com "exércitos de empréstimo" (ex.: Chelsea) têm muitas co-ocorrências e aparecem mais.
 - **O fator de liga pelo coeficiente UEFA** mede o desempenho dos clubes na Europa, não o nível médio de cada jogador. É uma aproximação.
 - **Contratações dependem de fatores fora dos dados** (preço, salário, agente, vontade do jogador), e 109 clubes de teste dão pouca confiança estatística nas diferenças entre modelos.
 - **Validação com vazamento parcial** no modelo de conteúdo (ver 5.1).
 
-## 8. Conclusão
-
-É possível levar um recomendador de filmes para o scouting mantendo a filtragem colaborativa, desde que se encontre a "interação" certa: **clube × jogador**. As redes de transferência são reais e aprendíveis. A CF acerta 3,5 a 4,5 vezes mais que o acaso na tarefa, bem difícil, de prever as contratações da temporada seguinte, enquanto recomendar os mais valorizados é pior que sortear.
-
-A camada de conteúdo resolve o que a CF não resolve: o cold start (buscar por um jogador de referência) e a pergunta típica do olheiro ("quem joga como X?"), com um KNN que **recupera a posição dos jogadores em 70% dos casos sem saber a posição**. A combinação das duas, mais os filtros de decisão, é o que um departamento de scouting usaria.
-
 Trabalhos futuros:
 - incluir mais temporadas (validação sem vazamento, tendência de evolução);
 - incluir mais ligas (Brasileirão, Portugal) e ajuste por posse;
-- incluir valor e salário como restrição de orçamento;
-- usar o ranking como triagem para vídeo.
 
 ---
 
