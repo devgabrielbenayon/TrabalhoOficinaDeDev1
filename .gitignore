@@ -1,5 +1,6 @@
 data/raw/
-data/user_ratings.csv
+data/shortlists.csv
+data/processed/
 __pycache__/
 *.pyc
 .venv/
