@@ -1,205 +1,222 @@
-"""Modelos de recomendação: baseline de popularidade, Item-KNN e SVD.
+"""Modelos de recomendação clube -> jogador.
 
 Todos seguem a mesma interface:
-    fit(R)                      -> treina com a matriz esparsa usuário×item R
-    scores(user_row)            -> vetor de pontuações (1 por item) para um usuário
-    recommend(user_row, k)      -> índices dos k melhores itens, EXCLUINDO os já avaliados
-    predict(user_row, items)    -> nota prevista para itens específicos (usado no RMSE)
+    fit(R)                        -> treina com a matriz esparsa clube×jogador (peso implícito)
+    scores(club_row, club_id)     -> pontuação de cada jogador (item) para o clube
+    recommend(club_row, k, ...)   -> k melhores jogadores do pool, EXCLUINDO quem já passou
+                                     pelo clube
 
-`user_row` é um vetor esparso 1×n_itens com as notas do usuário. Assim o mesmo código
-serve para usuários do treino e para usuários novos criados na interface (fold-in),
-sem precisar retreinar o modelo.
+`club_row` é a linha 1×n_jogadores do clube (histórico + shortlist feita na interface),
+então o mesmo código atende clubes do treino e clubes novos (fold-in), sem retreinar.
+
+Filtragem colaborativa: Popularidade (baseline), Item-KNN, SVD.
+Conteúdo: perfil estatístico (FBref) + faixa de valor do elenco.  Híbrido: combinação.
 """
 
 import numpy as np
-from scipy.sparse import csr_matrix, diags
+import pandas as pd
+from scipy.sparse import csr_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 
+from src import config as C
+from src.features import build_feature_matrix
 
-def _user_mean(user_row: csr_matrix, default: float) -> float:
-    return float(user_row.data.mean()) if user_row.nnz else default
 
-
-def _center_rows(R: csr_matrix) -> tuple[csr_matrix, np.ndarray]:
-    """Subtrai a média de cada usuário apenas das notas observadas."""
-    R = R.tocsr().astype(np.float64)
-    counts = np.diff(R.indptr)
-    sums = np.asarray(R.sum(axis=1)).ravel()
-    means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
-    C = R.copy()
-    C.data -= np.repeat(means, counts)
-    return C, means
+def _minmax(s: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    v = s[mask]
+    lo, hi = (v.min(), v.max()) if len(v) else (0.0, 1.0)
+    out = np.zeros_like(s, dtype=np.float64)
+    if hi > lo:
+        out[mask] = (v - lo) / (hi - lo)
+    return out
 
 
 class BaseRecommender:
     name = "base"
 
-    def fit(self, R: csr_matrix):
+    def fit(self, R: csr_matrix, pool_mask: np.ndarray):
+        """pool_mask: itens (jogadores) que podem ser recomendados (universo scoutável)."""
         self.n_items = R.shape[1]
-        self.global_mean = float(R.data.mean())
+        self.pool_mask = pool_mask
         return self
 
-    def scores(self, user_row: csr_matrix) -> np.ndarray:
+    def scores(self, club_row: csr_matrix, club_id=None) -> np.ndarray:
         raise NotImplementedError
 
-    def recommend(self, user_row: csr_matrix, k: int = 10, exclude_seen: bool = True) -> np.ndarray:
-        s = self.scores(user_row).astype(np.float64).copy()
-        if exclude_seen and user_row.nnz:
-            s[user_row.indices] = -np.inf  # nunca recomendar itens já conhecidos
-        k = min(k, int(np.isfinite(s).sum()))
-        top = np.argpartition(-s, k - 1)[:k] if k > 0 else np.array([], dtype=int)
-        return top[np.argsort(-s[top])]
-
-    def predict(self, user_row: csr_matrix, items: np.ndarray) -> np.ndarray:
-        raise NotImplementedError
+    def recommend(self, club_row: csr_matrix, k: int = C.K, club_id=None,
+                  allowed: np.ndarray | None = None) -> np.ndarray:
+        s = self.scores(club_row, club_id).astype(np.float64).copy()
+        ok = self.pool_mask.copy() if allowed is None else self.pool_mask & allowed
+        ok[club_row.indices] = False  # nunca recomendar quem já passou pelo clube
+        s[~ok] = -np.inf
+        k = min(k, int(ok.sum()))
+        if k <= 0:
+            return np.array([], dtype=int)
+        top = np.argpartition(-s, k - 1)[:k]
+        return top[np.argsort(-s[top], kind="stable")]
 
 
 class PopularityRecommender(BaseRecommender):
-    """Ranking por média bayesiana: (C·m + Σnotas) / (C + n).
-
-    Puxa para a média global filmes com poucas avaliações, evitando que um filme com
-    uma única nota 5 fique no topo. Não é personalizado: é o baseline e a solução de
-    cold start (usuário sem histórico).
-    """
+    """Baseline não personalizado: jogadores mais valorizados (valor de mercado antes do
+    corte). É também a resposta de cold start para um clube sem histórico."""
 
     name = "Popularidade"
 
-    def __init__(self, C: float | None = None):
-        self.C = C
+    def __init__(self, item_value: np.ndarray):
+        self.item_value = item_value
 
-    def fit(self, R: csr_matrix):
-        super().fit(R)
-        Rc = R.tocsc()
-        n = np.diff(Rc.indptr).astype(np.float64)
-        s = np.asarray(Rc.sum(axis=0)).ravel()
-        C = self.C if self.C is not None else float(np.median(n[n > 0]))
-        self.item_count = n
-        self.item_mean = np.divide(s, n, out=np.full_like(s, self.global_mean), where=n > 0)
-        self.bayes = (C * self.global_mean + s) / (C + n)
-        # ranking = média bayesiana ponderada pelo log do nº de avaliações:
-        # favorece filmes bem avaliados E conhecidos por muita gente
-        self._rank = self.bayes * np.log1p(n)
+    def fit(self, R, pool_mask):
+        super().fit(R, pool_mask)
+        self._s = np.log1p(np.nan_to_num(self.item_value, nan=0.0))
         return self
 
-    def scores(self, user_row: csr_matrix) -> np.ndarray:
-        return self._rank
-
-    def predict(self, user_row: csr_matrix, items: np.ndarray) -> np.ndarray:
-        return self.bayes[items]
-
-
-def _cosine_topk(M: csr_matrix, k: int) -> csr_matrix:
-    """Similaridade de cosseno entre colunas de M, mantendo os k maiores vizinhos por item."""
-    Mn = normalize(M.tocsc().astype(np.float64), axis=0)  # colunas norma 1 -> produto = cosseno
-    S = (Mn.T @ Mn).toarray()
-    np.fill_diagonal(S, 0.0)
-    S[S < 0] = 0.0
-    if k < S.shape[0]:
-        idx = np.argpartition(-S, k, axis=0)[k:, :]
-        np.put_along_axis(S, idx, 0.0, axis=0)
-    return csr_matrix(S.astype(np.float32))  # S[i, j] = similaridade de i como vizinho de j
-
-
-def _center_row(user_row: csr_matrix, global_mean: float) -> tuple[csr_matrix, float]:
-    mu = _user_mean(user_row, global_mean)
-    c = user_row.astype(np.float64).copy()
-    c.data -= mu
-    return c, mu
+    def scores(self, club_row, club_id=None):
+        return self._s
 
 
 class ItemKNNRecommender(BaseRecommender):
-    """Filtragem colaborativa baseada em itens ("quem viu X também viu Y").
-
-    Duas matrizes de similaridade de cosseno item×item, cada uma com os k vizinhos
-    mais próximos de cada filme:
-
-    * Ranking (top-N): similaridade sobre as notas brutas. Pontuação do item j para
-      o usuário u:  Σ_i sim(j,i) · r_ui  sobre os filmes i do histórico de u.
-      Capta tanto "o que ele assistiu" quanto "o quanto gostou".
-    * Nota prevista (RMSE): similaridade sobre notas centralizadas pela média do
-      usuário, e  r̂_uj = r̄_u + Σ sim·(r_ui − r̄_u) / Σ sim.
-
-    Na avaliação offline, ranquear pela nota prevista foi muito pior (favorece filmes
-    obscuros com 1–2 vizinhos), por isso o ranking usa as notas brutas (ver README).
-    """
+    """Jogadores parecidos = jogadores que passaram pelos MESMOS clubes (cosseno entre as
+    colunas de R). Pontuação para o clube c:  Σ_i sim(j,i) · w_ci  sobre o histórico de c.
+    Captura "rotas de transferência" (clubes que compram/vendem entre si) e ex-companheiros."""
 
     name = "Item-KNN"
 
-    def __init__(self, k_neighbors: int = 50):
+    def __init__(self, k_neighbors: int = 100):
         self.k = k_neighbors
 
-    def fit(self, R: csr_matrix):
-        super().fit(R)
-        self.S_rank = _cosine_topk(R, self.k)
-        self.S_pred = _cosine_topk(_center_rows(R)[0], self.k)
+    def fit(self, R, pool_mask):
+        super().fit(R, pool_mask)
+        Rn = normalize(R.tocsc().astype(np.float64), axis=0)
+        S = (Rn.T @ Rn).tocsc()          # esparsa: só pares que dividiram clube
+        S.setdiag(0)
+        S.eliminate_zeros()
+        # poda: mantém os k maiores por coluna
+        S = S.tocsc()
+        for j in range(S.shape[1]):
+            a, b = S.indptr[j], S.indptr[j + 1]
+            if b - a > self.k:
+                col = S.data[a:b]
+                cut = np.partition(col, -self.k)[-self.k]
+                col[col < cut] = 0
+        S.eliminate_zeros()
+        self.S = S.tocsr()
         return self
 
-    def scores(self, user_row: csr_matrix) -> np.ndarray:
-        return np.asarray((user_row @ self.S_rank).todense()).ravel()
+    def scores(self, club_row, club_id=None):
+        return np.asarray((club_row @ self.S).todense()).ravel()
 
-    def predict(self, user_row: csr_matrix, items: np.ndarray) -> np.ndarray:
-        c, mu = _center_row(user_row, self.global_mean)
-        S = self.S_pred[:, items]
-        num = np.asarray((c @ S).todense()).ravel()
-        mask = user_row.copy()
-        mask.data[:] = 1.0
-        den = np.asarray((mask @ S).todense()).ravel()
-        pred = mu + np.divide(num, den, out=np.zeros_like(num), where=den > 1e-9)
-        return np.clip(pred, 0.5, 5.0)
-
-    def explain(self, user_row: csr_matrix, item: int, top: int = 3) -> list[int]:
-        """Filmes do histórico que mais contribuíram para recomendar `item`."""
-        sims = np.asarray(self.S_rank[user_row.indices, item].todense()).ravel()
-        contrib = sims * user_row.data
-        order = np.argsort(-contrib)[:top]
-        return [int(user_row.indices[o]) for o in order if contrib[o] > 0]
+    def explain(self, club_row, item: int, top: int = 2) -> list[int]:
+        """Jogadores do histórico do clube que mais contribuíram para recomendar `item`."""
+        sims = np.asarray(self.S[club_row.indices, item].todense()).ravel() * club_row.data
+        order = np.argsort(-sims)[:top]
+        return [int(club_row.indices[o]) for o in order if sims[o] > 0]
 
 
 class SVDRecommender(BaseRecommender):
-    """Fatoração de matrizes com SVD truncado: R ≈ U·Σ·Vᵀ com poucos fatores latentes.
-
-    Cada fator latente captura um "gosto" (ex.: ação, cult, animação). Para qualquer
-    usuário (inclusive um novo, criado na interface) usa-se fold-in, sem retreinar:
-        z = x·V   (perfil do usuário no espaço de fatores)
-        x̂ = z·Vᵀ  (reconstrução = pontuação para todos os filmes)
-
-    * Ranking (top-N): SVD sobre as notas brutas, com 0 onde não há nota ("PureSVD",
-      Cremonesi et al., 2010).
-    * Nota prevista (RMSE): SVD sobre notas centralizadas pela média do usuário,
-      mais um viés de item:  r̂_uj = r̄_u + b_j + x̂_j.
-    """
+    """Fatoração R ≈ U·Σ·Vᵀ. Fatores latentes ~ "mercados" (liga, país, patamar do clube).
+    Fold-in para qualquer clube: z = x·V, pontuação = z·Vᵀ."""
 
     name = "SVD"
 
-    def __init__(self, n_factors: int = 50, random_state: int = 42):
+    def __init__(self, n_factors: int = 64, random_state: int = 42):
         self.n_factors = n_factors
         self.random_state = random_state
 
-    def fit(self, R: csr_matrix):
-        super().fit(R)
-        svd = lambda: TruncatedSVD(n_components=self.n_factors, random_state=self.random_state)
-        self.V_rank = svd().fit(R).components_  # (fatores × itens)
-        C, _ = _center_rows(R)
-        self.V_pred = svd().fit(C).components_
-        # viés de item: quanto cada filme fica acima/abaixo da média dos seus avaliadores
-        n = np.diff(C.tocsc().indptr)
-        self.item_bias = np.asarray(C.sum(axis=0)).ravel() / (n + 10.0)
+    def fit(self, R, pool_mask):
+        super().fit(R, pool_mask)
+        self.V = TruncatedSVD(self.n_factors, random_state=self.random_state).fit(R).components_
         return self
 
-    def scores(self, user_row: csr_matrix) -> np.ndarray:
-        z = np.asarray(user_row @ self.V_rank.T).ravel()
-        return z @ self.V_rank
-
-    def predict(self, user_row: csr_matrix, items: np.ndarray) -> np.ndarray:
-        c, mu = _center_row(user_row, self.global_mean)
-        z = np.asarray(c @ self.V_pred.T).ravel()
-        pred = mu + self.item_bias[items] + z @ self.V_pred[:, items]
-        return np.clip(pred, 0.5, 5.0)
+    def scores(self, club_row, club_id=None):
+        z = np.asarray(club_row @ self.V.T).ravel()
+        return z @ self.V
 
 
-MODELS = {
-    "Popularidade": PopularityRecommender,
-    "Item-KNN": ItemKNNRecommender,
-    "SVD": SVDRecommender,
-}
+class ContentRecommender(BaseRecommender):
+    """Baseado em conteúdo (FBref + valor de mercado), sem usar outros clubes.
+
+    Para o clube c e o candidato j (grupo de posição g):
+      estilo(j)  = −distância entre o vetor de métricas de j e o perfil médio dos
+                   jogadores do histórico de c no grupo g (ponderado pelo peso na matriz);
+      preço(j)   = −|log(valor_j) − média ponderada do log(valor) do histórico de c|;
+      score      = estilo normalizado + price_weight · preço normalizado.
+    Um clube cujo histórico não tem jogadores com métricas FBref fica só com o termo de
+    preço (se houver) ou sem pontuação (cold start).
+    """
+
+    name = "Conteúdo"
+
+    def __init__(self, players: pd.DataFrame, item_ids: np.ndarray, item_value: np.ndarray,
+                 price_weight: float = 1.0):
+        self.players = players
+        self.item_ids = item_ids
+        self.item_value = item_value
+        self.price_weight = price_weight
+
+    def fit(self, R, pool_mask):
+        super().fit(R, pool_mask)
+        pos = {pid: i for i, pid in enumerate(self.item_ids)}
+        self.item_group = np.full(self.n_items, None, dtype=object)
+        self.Zw = {}
+        for g in C.GROUP_LABEL:
+            pool, _, Zw = build_feature_matrix(self.players, g)
+            Zw = Zw[pool.player_id.notna().to_numpy()]
+            ids = pool.loc[Zw.index, "player_id"].astype(int).to_numpy()
+            keep = np.array([p in pos for p in ids])
+            Zw, ids = Zw[keep], ids[keep]
+            cols = np.array([pos[p] for p in ids])
+            self.item_group[cols] = g
+            self.Zw[g] = (cols, Zw.to_numpy())
+        self.log_value = np.log1p(np.nan_to_num(self.item_value, nan=0.0))
+        return self
+
+    def club_profile(self, club_row) -> dict:
+        """Centróide, por grupo, dos jogadores do histórico do clube que têm métricas FBref.
+
+        Usa só a linha do clube na matriz (dados ANTES do corte, peso maior para quem jogou
+        mais e mais recentemente), então não há vazamento; a shortlist da interface entra
+        aqui também e desloca o perfil.
+        """
+        w_all = np.zeros(self.n_items)
+        w_all[club_row.indices] = club_row.data
+        prof = {}
+        for g, (cols, Z) in self.Zw.items():
+            w = w_all[cols]
+            if w.sum() > 0:
+                prof[g] = np.average(Z, axis=0, weights=w)
+        return prof
+
+    def scores(self, club_row, club_id=None):
+        style = np.zeros(self.n_items)
+        has_style = np.zeros(self.n_items, dtype=bool)
+        for g, centroid in self.club_profile(club_row).items():
+            cols, Z = self.Zw[g]
+            style[cols] = -np.linalg.norm(Z - centroid, axis=1)
+            has_style[cols] = True
+        price = np.zeros(self.n_items)
+        known = club_row.indices[self.log_value[club_row.indices] > 0]
+        if len(known):
+            w = np.asarray(club_row[:, known].todense()).ravel()
+            price = -np.abs(self.log_value - np.average(self.log_value[known], weights=w))
+        mask = self.pool_mask
+        return _minmax(style, mask & has_style) + self.price_weight * _minmax(price, mask)
+
+
+class HybridRecommender(BaseRecommender):
+    """α·CF + (1−α)·Conteúdo, com as pontuações normalizadas (min-max) no pool."""
+
+    name = "Híbrido"
+
+    def __init__(self, cf: BaseRecommender, content: ContentRecommender, alpha: float = 0.5):
+        self.cf, self.content, self.alpha = cf, content, alpha
+
+    def fit(self, R, pool_mask):
+        super().fit(R, pool_mask)
+        return self  # componentes já treinados
+
+    def scores(self, club_row, club_id=None):
+        m = self.pool_mask
+        cf = _minmax(self.cf.scores(club_row, club_id), m)
+        ct = _minmax(self.content.scores(club_row, club_id), m)
+        return self.alpha * cf + (1 - self.alpha) * ct
