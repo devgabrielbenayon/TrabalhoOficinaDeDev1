@@ -139,6 +139,10 @@ with tab_sim:
     if players.at[ref, "Min"] < C.MIN_MINUTES:
         st.warning(f"⚠️ {players.at[ref, 'Player']} jogou só {int(players.at[ref, 'Min'])} min: "
                    "amostra pequena, métricas por 90 instáveis.")
+    real_group = players.at[ref, "group"]
+    if real_group != group:
+        st.info(f"{players.at[ref, 'Player']} é {C.GROUP_LABEL.get(real_group, real_group)}. "
+                f"A comparação usa as métricas de {C.GROUP_LABEL[group]} e os vizinhos são desse grupo.")
 
     feats = C.FEATURES[group]
     with st.expander("🎛️ Filtros (camada de decisão)", expanded=True):

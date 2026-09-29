@@ -60,8 +60,11 @@ def find_similar(players: pd.DataFrame, ref: int, n: int = 10, filt: ScoutFilter
     """
     filt = filt or ScoutFilter()
     group = group or players.at[ref, "group"]
+    min_minutes = feature_kw.get("min_minutes", C.MIN_MINUTES)
     pool, X, Zw = build_feature_matrix(players, group, weights, include=[ref], **feature_kw)
-    base = pool["Min"] >= feature_kw.get("min_minutes", C.MIN_MINUTES)
+    # candidatos e percentil: só o grupo escolhido, com minutos; a referência fica de fora
+    in_group = pool["group"].notna() if group == "GERAL" else pool["group"].eq(group)
+    base = in_group & (pool["Min"] >= min_minutes)
     cand = Zw[filt.mask(pool, X, base) & (Zw.index != ref) & base]
     cols = ["Player", "Squad", "league", "Age", "Min", "value_eur", "sub_position"]
     if cand.empty:

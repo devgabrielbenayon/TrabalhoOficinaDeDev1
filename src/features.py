@@ -1,8 +1,8 @@
 """Engenharia de atributos para o KNN de jogadores.
 
 Pipeline (por grupo de posição):
-  1. pool elegível: jogadores do grupo com ≥ MIN_MINUTES (o jogador de referência é
-     sempre incluído, mesmo abaixo do corte);
+  1. pool elegível: jogadores do grupo com ≥ MIN_MINUTES (quem está em `include`,
+     em geral a referência, entra mesmo abaixo do corte ou de outro grupo);
   2. contagens -> por 90 minutos;
   3. percentuais recalculados e encolhidos para a média do grupo pelo nº de tentativas
      (um zagueiro com 2/2 duelos aéreos não vira "100%");
@@ -39,9 +39,11 @@ def build_feature_matrix(players: pd.DataFrame, group: str, weights: dict | None
     (é o espaço onde o KNN mede distância).
     """
     weights = weights or C.FEATURES[group]
-    in_group = players["group"].notna() if group == "GERAL" else players["group"] == group
-    ok = in_group & ((players["Min"] >= min_minutes) | players.index.isin(list(include)))
-    pool = players[ok]
+    in_group = players["group"].notna() if group == "GERAL" else players["group"].eq(group)
+    minutes_ok = players["Min"] >= min_minutes
+    # include traz a referência mesmo abaixo do corte ou de outro grupo ("Comparar como")
+    forced = players.index.isin(list(include))
+    pool = players[(in_group & minutes_ok) | forced]
     X = per90_matrix(pool, weights)
 
     Xs = X.copy()
@@ -49,8 +51,9 @@ def build_feature_matrix(players: pd.DataFrame, group: str, weights: dict | None
         cols = [c for c in Xs if c in C.OUTPUT_COLS]
         Xs[cols] = Xs[cols].mul(pool["Comp"].map(C.LEAGUE_FACTOR).fillna(1.0), axis=0)
 
-    # média/desvio calculados só com quem passou no corte de minutos
-    base = pool["Min"] >= min_minutes
+    # média/desvio só de quem é do grupo e passou no corte: a referência fora do
+    # grupo (ou abaixo dos minutos) entra no vetor, mas não desloca a régua
+    base = in_group.reindex(pool.index, fill_value=False) & (pool["Min"] >= min_minutes)
     if within_league:
         g = Xs[base].groupby(pool.loc[base, "Comp"])
         mu = g.mean().reindex(pool["Comp"]).set_axis(pool.index)
