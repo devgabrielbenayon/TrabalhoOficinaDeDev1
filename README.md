@@ -1,6 +1,11 @@
-# 🎬 Sistema de Recomendação de Filmes com Filtragem Colaborativa
+# ⚽ Scouting e Recomendação de Jogadores de Futebol
 
-Sistema de recomendação de filmes construído sobre o dataset **MovieLens (ml-latest-small)**. Ele usa **filtragem colaborativa** (Item-KNN e SVD) e é comparado com um baseline de popularidade. A interface é feita em **Streamlit**.
+Sistema de recomendação para **scouting de futebol masculino**, com duas camadas:
+
+1. **Filtragem colaborativa** (Item-KNN, SVD) sobre uma base real de interações **clube × jogador** (Transfermarkt): "clubes com histórico de elenco parecido com o seu tiveram estes jogadores".
+2. **KNN por métricas de desempenho** (FBref 2024/25): "encontre os volantes mais parecidos com o Zubimendi que jogam na Serie A, têm até 24 anos e estão no top 30% em interceptações".
+
+As duas se combinam num modelo **híbrido**. A interface é em **Streamlit**.
 
 > 🎥 **Vídeo de demonstração:** _adicionar link aqui_
 
@@ -8,128 +13,197 @@ Sistema de recomendação de filmes construído sobre o dataset **MovieLens (ml-
 
 ## 1. Objetivo
 
-Recomendar a cada usuário filmes que ele **ainda não viu** e que provavelmente vai gostar, usando só o histórico de avaliações de todos os usuários (quem gostou do mesmo que você também gostou de...). O sistema deve:
+Ajudar o departamento de scouting de um clube a encontrar jogadores que ele **ainda não teve** e que se encaixam no seu perfil. O sistema deve:
 
-- usar uma base de interações usuário × item;
-- preparar os dados e implementar filtragem colaborativa;
-- gerar recomendações personalizadas **sem itens já conhecidos** pelo usuário;
-- oferecer uma interface para consultar históricos e recomendações e para avaliar filmes;
-- ser avaliado com usuários de teste e métricas adequadas.
+- usar uma **base de interações usuário × item**: aqui, **clube (usuário) × jogador (item)**;
+- aplicar **filtragem colaborativa** e gerar recomendações **sem jogadores que já passaram pelo clube**;
+- permitir buscar **jogadores estatisticamente similares** a uma referência, com filtros por posição, liga, clube, idade, valor e limites de métricas;
+- oferecer uma interface para consultar históricos e recomendações e para **avaliar jogadores** (shortlist do olheiro);
+- ser **avaliado com clubes de teste**, usando contratações reais.
 
 ## 2. Fundamentação
 
-**Filtragem colaborativa (FC)** recomenda com base em padrões de comportamento coletivo, sem olhar o conteúdo dos itens (gênero, sinopse etc.). Ela parte de uma matriz **R** (usuários × itens), em que `r_ui` é a nota do usuário *u* para o filme *i*. Essa matriz é muito esparsa: aqui, 98,3% das células estão vazias.
-
-| Abordagem | Ideia | Implementação neste projeto |
-|---|---|---|
-| **Baseada em memória (Item-KNN)** | Dois filmes são parecidos se foram avaliados de forma parecida pelos mesmos usuários. Recomenda filmes parecidos com os que o usuário já avaliou bem. | Similaridade de **cosseno** entre as colunas de R, mantendo os **k = 50** vizinhos de cada filme. Pontuação: `score(u,j) = Σᵢ sim(j,i)·r_ui` |
-| **Baseada em modelo (SVD)** | Aproxima R por poucos **fatores latentes** (`R ≈ U·Σ·Vᵀ`). Cada fator representa um "gosto" escondido (ex.: ação/aventura, filmes cult). | `TruncatedSVD` com **50 fatores**. Para qualquer usuário: `z = x·V`, `score = z·Vᵀ` (*fold-in*) |
-| **Baseline: Popularidade** | Recomenda os filmes mais populares e bem avaliados, sem personalização. | Média bayesiana `(C·m + Σnotas)/(C + n)` × `log(1+n)` |
-
-Conceitos importantes:
-
-- **Centralização pela média do usuário** (`r_ui − r̄_u`) remove o viés de usuários "generosos" ou "exigentes". É usada para **prever notas**.
-- **Cold start:** um usuário sem histórico não tem vizinhos nem fatores, então a FC não se aplica. Nesse caso o sistema usa o baseline de popularidade até o usuário avaliar alguns filmes.
-- **Fold-in:** o perfil de um usuário novo (ou de alguém que acabou de avaliar um filme) é projetado no modelo já treinado sem retreinar. É isso que deixa a interface responder na hora.
+| Conceito | Neste projeto |
+|---|---|
+| **Filtragem colaborativa com feedback implícito** | Não existem "notas" de clubes para jogadores. A interação é *ter atuado pelo clube*, com peso `log(1 + jogos completos) · 0,8^anos desde a última partida`: quem jogou mais e mais recentemente pesa mais. |
+| **Item-KNN** | Dois jogadores são parecidos se passaram pelos **mesmos clubes** (cosseno entre as colunas da matriz). Pontuação para o clube *c*: `Σᵢ sim(j,i)·w_ci`. Captura **rotas de transferência** (clubes que compram e vendem entre si) e ex-companheiros. |
+| **SVD (fatoração de matrizes)** | `R ≈ U·Σ·Vᵀ` com 256 fatores latentes, que funcionam como "mercados" (liga, país, patamar do clube). Usa *fold-in* para clubes novos: `z = x·V`, `score = z·Vᵀ`. |
+| **Conteúdo (KNN por métricas)** | Cada jogador vira um vetor de métricas por 90 minutos, padronizado (z-score) dentro do seu grupo de posição e ponderado por posição. Similaridade = distância euclidiana ponderada `Σ wₖ (zₖ − z'ₖ)²`. |
+| **Híbrido** | `α·CF + (1−α)·Conteúdo`, com as pontuações normalizadas (min-max) e α = 0,75. |
+| **Cold start** | Um clube sem histórico não tem vizinhos. O sistema recomenda por **popularidade** (valor de mercado) e sugere a busca por jogador de referência, que não precisa de histórico. |
+| **Camada de decisão** | Regras aplicadas **antes** do KNN e da recomendação (`ScoutFilter`): posição, liga, clube, idade, valor máximo, mínimo por 90 e "top X% do grupo" em uma métrica. |
 
 ## 3. Dados
 
-**Fonte:** [MovieLens Latest Small](https://grouplens.org/datasets/movielens/latest/), do GroupLens Research (Universidade de Minnesota). O script baixa o dataset automaticamente na primeira execução. Ele pode ser usado para pesquisa e ensino ([licença](https://files.grouplens.org/datasets/movielens/ml-latest-small-README.html)).
+### 3.1 Fontes usadas
 
-| | Bruto | Após filtro (≥ 5 avaliações por filme) |
-|---|---:|---:|
-| Usuários | 610 | 610 |
-| Filmes | 9.724 | 3.650 |
-| Avaliações | 100.836 | 90.274 |
-| Esparsidade | 98,30% | 95,95% |
-| Nota média | 3,50 | 3,54 |
-| Avaliações por usuário (mín. / mediana) | 20 / 70,5 | 12 / 68 |
+| Dataset | Conteúdo | Uso |
+|---|---|---|
+| [Football Players Stats 2024-2025](https://www.kaggle.com/datasets/hubertsidorowicz/football-players-stats-2024-2025) (Kaggle, dados do FBref/Opta) | 2.854 linhas × 267 colunas: métricas avançadas das 5 grandes ligas (PrgP, PrgC, Int, TklW, xG, xAG, SCA, duelos aéreos...) | vetores de conteúdo do KNN |
+| [Football Data from Transfermarkt](https://www.kaggle.com/datasets/davidcariboo/player-scores) (Kaggle) | 1,9 milhão de aparições (jogador × clube × jogo × minutos), transferências, posição detalhada (`sub_position`), valores de mercado | matriz clube × jogador, conjunto de teste, posição, valor |
 
-Arquivos usados: `ratings.csv` (userId, movieId, rating 0,5–5, timestamp) e `movies.csv` (movieId, title, genres).
+Os dois são baixados automaticamente com `kagglehub`, sem precisar de login.
 
-**Exploração** (aba *Dataset* da interface):
+**Por que a temporada 2024/25?** Em **20/01/2026** a Opta encerrou o fornecimento de dados avançados ao FBref ([anúncio](https://www.sports-reference.com/blog/2026/01/fbref-stathead-data-update/)). Com isso, xG, passes progressivos e SCA deixaram de ser atualizados. A 2024/25 é a última temporada completa com esses dados, e o script confirma que as colunas estão 100% preenchidas.
 
-- As notas se concentram em 3–4 (4,0 = 26,6%, 3,0 = 19,9%), e 48% das avaliações são ≥ 4.
-- **Cauda longa:** a maioria dos filmes tem pouquíssimas avaliações (3.446 filmes têm só uma), enquanto só 18 filmes têm mais de 200.
-- Drama, Comédia, Ação e Thriller dominam as avaliações.
+### 3.2 Outras fontes (e por que não foram usadas)
 
-**Preparação** ([src/data.py](src/data.py)):
+| Fonte | Acesso | Cobertura / limitação |
+|---|---|---|
+| StatsBomb Open Data (`statsbombpy`) | grátis, oficial | dados de eventos completos, mas só algumas competições e temporadas (Copas, Euros, temporadas avulsas) |
+| FBref via `soccerdata` / `worldfootballR` | scraping | muitas ligas (incl. Brasileirão), mas **sem dados avançados desde jan/2026**, com limite de requisições e termos de uso |
+| Understat (`soccerdata`, `understatapi`) | scraping | xG/xA de 6 ligas desde 2014/15; quase nada defensivo |
+| WhoScored / Sofascore / FotMob | APIs não oficiais | amplos, mas instáveis e contrários aos termos de uso |
+| Opta, Wyscout, StatsBomb (pago) | comercial | cobertura global, incluindo Brasileirão; caro |
 
-1. Download e leitura dos CSVs.
-2. Remoção de filmes com menos de 5 avaliações. Com tão poucos dados a similaridade não é confiável, e o filtro reduz a esparsidade de 98,3% para 96,0% mantendo 90% das avaliações.
-3. Mapeamento de `userId`/`movieId` para índices e montagem da matriz esparsa `scipy.sparse.csr_matrix` (610 × 3.650).
+### 3.3 Preparação ([src/data.py](src/data.py), [src/matching.py](src/matching.py))
+
+1. **FBref:** 152 jogadores trocaram de clube durante a temporada e têm uma linha por clube. As contagens são somadas, e o resultado são 2.699 jogadores. A coluna `Blocks` do CSV é de *passes bloqueados*; os bloqueios defensivos estão em `Blocks_stats_defense`.
+2. **Cruzamento FBref ↔ Transfermarkt:** os dois sites não compartilham IDs, então o cruzamento é feito em 3 etapas:
+   1. nome normalizado + ano de nascimento;
+   2. `rapidfuzz` ≥ 88 + mesmo ano + mesma liga;
+   3. nome parcial + mesmo ano + mesmo clube.
+
+   Resultado: **99,7% cruzados**, incluindo apelidos como *Sávio ↔ Savinho*, *Obite N'Dicka ↔ Evan Ndicka* e *Valentín ↔ Taty Castellanos*.
+3. **Grupos de posição** pelo `sub_position` do Transfermarkt, que é mais fino que o `Pos` do FBref: ZAG (zagueiro), LAT (lateral), **VOL (volante = Defensive Midfield)**, MEI (meia), PON (ponta), ATA (centroavante). Goleiros ficam fora, porque suas métricas são outras.
+4. **Universo scoutável:** jogadores de linha com **≥ 900 minutos** (≈ 10 jogos completos), totalizando **1.451 jogadores**.
+5. **Matriz clube × jogador** (treino, antes de 01/07/2025): **1.098 clubes × 26.784 jogadores, 53.498 interações** (esparsidade de 99,82%). Inclui todas as ligas do Transfermarkt (Brasileirão, Portugal, Holanda...), o que dá mais co-ocorrências. As recomendações se restringem ao universo scoutável.
 
 ## 4. Método
 
-### 4.1 Modelos ([src/models.py](src/models.py))
+### 4.1 Mapeamento do domínio (filmes → futebol)
 
-Os três modelos têm a mesma interface: `fit(R)`, `recommend(usuario, k)` e `predict(usuario, itens)`.
-**Em `recommend`, os filmes já avaliados recebem pontuação −∞ antes do top-N**, então nunca são recomendados. A avaliação também verifica isso com um `assert`.
+O projeto começou como um recomendador de filmes (MovieLens). A arquitetura foi mantida e o domínio trocado:
 
-Item-KNN e SVD têm **duas "cabeças"**:
-
-| | Ranking (top-N) | Previsão de nota (RMSE) |
-|---|---|---|
-| Item-KNN | cosseno sobre notas **brutas**; `Σ sim·r_ui` | cosseno sobre notas **centralizadas**; `r̄_u + Σ sim·(r_ui − r̄_u) / Σ sim` |
-| SVD | SVD das notas **brutas** (PureSVD, Cremonesi et al. 2010) | SVD das notas **centralizadas** + viés do filme: `r̄_u + b_j + x̂_j` |
-
-**Por que duas cabeças?** Nos testes, ranquear pela nota prevista foi muito pior (tabela 5.2). A nota prevista não tem noção de *confiança*: um filme obscuro com um único vizinho pode ter previsão 5,0 e vai para o topo. A matriz bruta, com 0 onde não há nota, carrega também a informação de **o que o usuário escolheu assistir**, que é um sinal forte para recomendar.
-
-### 4.2 Protocolo de avaliação ([src/evaluate.py](src/evaluate.py))
-
-- **Divisão treino/teste por usuário:** para cada um dos 610 usuários, 20% das avaliações (sorteio, seed 42) ficam escondidas como teste. Os modelos treinam só com os outros 80%.
-- **Usuários de teste:** os 600 usuários com pelo menos um filme relevante no teste.
-- **Relevante:** filme do teste com nota ≥ 4.
-- Para cada usuário, o modelo gera um top-10, excluindo os filmes do treino, que é comparado com os relevantes do teste.
-
-**Métricas:**
-
-| Métrica | O que mede |
+| Filmes | Futebol |
 |---|---|
-| **Precision@10** | fração das 10 recomendações que são relevantes |
-| **Recall@10** | fração dos relevantes do usuário que apareceram no top-10 |
-| **NDCG@10** | como Recall, mas premia acertos nas primeiras posições |
-| **RMSE** | erro médio da nota prevista nos pares (usuário, filme) do teste |
-| **Cobertura** | % do catálogo que aparece em pelo menos uma recomendação (diversidade) |
+| usuário | clube (`club_id`) |
+| filme | jogador (`player_id`) |
+| nota 0,5–5 (explícita) | peso implícito por minutos e recência |
+| gêneros do filme | vetor de métricas por 90 (conteúdo) |
+| ≥ 5 avaliações por filme | ≥ 900 minutos |
+| usuário avalia filme na interface | olheiro adiciona à **shortlist** (interesse 1–5), aplicada por *fold-in* |
+| excluir filmes já vistos | excluir jogadores que já passaram pelo clube |
+
+### 4.2 Pipeline do KNN por métricas ([src/features.py](src/features.py))
+
+1. **Corte de minutos:** o pool tem ≥ 900 min. O jogador de referência entra mesmo abaixo do corte, com um aviso de "amostra pequena". Sem esse corte, alguém com 90 min e 1 gol teria 1 gol/90 e distorceria os vizinhos.
+2. **Por 90 minutos:** `contagem / (minutos / 90)`, para que minutos jogados não definam a similaridade.
+3. **Percentuais** (% passes certos, % duelos aéreos, % finalizações no alvo) são recalculados e **encolhidos** para a média do grupo: `(acertos + p̄·30) / (tentativas + 30)`. Um zagueiro com 2 de 2 duelos não vira "100%".
+4. **Z-score dentro do grupo de posição**, com média e desvio calculados só no pool elegível e valores cortados em ±3. Um volante é comparado com volantes.
+5. **Pesos por posição:** `Z · √w`, de modo que a distância euclidiana vira euclidiana ponderada.
+
+| Grupo | Métricas (peso) |
+|---|---|
+| ZAG | Interceptações (1,5), Desarmes certos (1,5), Duelos aéreos ganhos (1,5), Bloqueios, Cortes, % aéreos, Passes progressivos, % passes (1), Distância progressiva (0,75) |
+| LAT | Conduções progressivas (1,5), Passes progressivos (1,25), Desarmes (1,25), Cruzamentos para a área, xAG, Interceptações, Dribles (1), Passes-chave, Recuperações (0,75) |
+| **VOL** | **Passes progressivos (2), Interceptações (2), Desarmes (1,5), Recuperações (1,5)**, % passes, Passes para o terço final (1), Bloqueios, Aéreos (0,75), Conduções (0,5) |
+| MEI | Passes progressivos, Passes-chave, xAG (1,5), SCA (1,25), Passes para a área, Recepções progressivas, Dribles (1), npxG (0,75), Desarmes (0,5) |
+| PON | Dribles, Conduções progressivas (1,5), Recepções progressivas, xAG, npxG (1,25), Finalizações, SCA (1), Cruzamentos para a área, Toques na área (0,75) |
+| ATA | npxG (2), Finalizações, Toques na área (1,5), % no alvo, xAG, Aéreos, Recepções progressivas (1), SCA (0,75) |
+
+Os pesos podem ser ajustados com sliders na interface.
+
+**Diferença de nível entre ligas.** Comparar um jogador do Brasileirão com um da Premier League exige cuidado. O sistema tem três modos:
+
+- **Padrão:** z-score com todas as ligas juntas. Compara **estilo e intensidade**.
+- **Z-score dentro da liga:** cada jogador é comparado com a média do seu campeonato (percentil relativo).
+- **Ajuste de nível:** multiplica as **métricas de produção ofensiva** (npxG, xAG, SCA, passes-chave, passes progressivos, finalizações) por um fator de liga derivado do **coeficiente UEFA** (Inglaterra 1,00; Itália 0,85; Espanha 0,80; Alemanha 0,79; França 0,67; [fonte](https://en.wikipedia.org/wiki/UEFA_coefficient), 5 temporadas 2022/23–2026/27). As métricas defensivas não são ajustadas, porque dependem mais do estilo do time que do nível.
+
+Para incluir o Brasileirão, basta acrescentar os dados e o fator da liga em [src/config.py](src/config.py).
+
+**Distância:** euclidiana (padrão; considera perfil **e** intensidade) ou cosseno (só perfil: um jogador "igual, mas em menor volume" fica próximo).
+
+### 4.3 Camada de decisão + KNN ([src/scouting.py](src/scouting.py))
+
+```python
+from src.data import build_players
+from src.scouting import ScoutFilter, find_similar
+
+players = build_players()
+ref = players.index[players.Player == "Martín Zubimendi"][0]
+filt = ScoutFilter(leagues=["Serie A", "Ligue 1"], age=(18, 24),
+                   max_value_eur=30e6, top_pct={"Int": 30}, min_metrics={"PrgP": 4.0})
+ranking, X, Zw = find_similar(players, ref, n=10, filt=filt)
+```
+
+A `ScoutFilter` elimina candidatos **antes** do `NearestNeighbors`. O top X% é calculado sobre o grupo inteiro, não só sobre quem sobrou. `similaridade_%` indica de quantos % do grupo o candidato está mais perto do que o resto ("mais parecido que 99% dos volantes").
+
+### 4.4 Filtragem colaborativa e híbrido ([src/models.py](src/models.py))
+
+Todos os modelos compartilham `recommend(linha_do_clube, k)`. Os jogadores que já passaram pelo clube e os que estão fora do universo scoutável ou dos filtros recebem −∞, e a avaliação confere isso com um `assert`.
+
+- **Popularidade:** jogadores mais valorizados. É o baseline e a resposta de cold start.
+- **Item-KNN:** cosseno entre as colunas da matriz, mantendo os 1.000 vizinhos de cada jogador.
+- **SVD:** `TruncatedSVD` com 256 fatores.
+- **Conteúdo:** proximidade entre o vetor de métricas do candidato e o **perfil médio dos jogadores do histórico do clube** na mesma posição, ponderado pelo peso na matriz. Por usar só dados anteriores ao corte, não há vazamento, e a shortlist desloca esse perfil.
+- **Híbrido:** 0,75·Item-KNN + 0,25·Conteúdo.
+
+### 4.5 Protocolo de avaliação ([src/evaluate.py](src/evaluate.py))
+
+- **Divisão temporal**, que é a situação real do scouting: o modelo vê o passado e tenta prever o futuro.
+  - **Treino:** aparições antes de **01/07/2025**.
+  - **Teste:** contratações reais dos clubes das 5 grandes ligas entre **01/07/2025 e 02/02/2026** (janelas de verão e de janeiro), de jogadores do universo scoutável que **nunca** tinham passado pelo clube. Voltas de empréstimo são excluídas.
+  - Ficam **109 clubes de teste e 323 contratações**.
+- **Hiperparâmetros** escolhidos numa janela de **validação** separada (treino até 01/07/2024, contratações até 03/02/2025), sem olhar o teste: `python -m src.evaluate --tune`.
+- **Métricas @20:**
+  - **Precision@20:** fração das 20 recomendações que o clube contratou.
+  - **Recall@20:** fração das contratações do clube que estavam no top-20.
+  - **NDCG@20:** como o Recall, mas premia acertos no topo.
+  - **HitRate@20:** % de clubes com pelo menos um acerto.
+  - **Cobertura:** % do universo scoutável que aparece em alguma recomendação.
+- **Validação do KNN por métricas:** sem informar a posição (todas as métricas, peso 1), mede quantos dos 10 vizinhos de cada jogador têm a mesma posição. Se as métricas descrevem bem o papel em campo, os vizinhos devem ser da mesma posição.
 
 ## 5. Resultados
 
-Reproduza com `python -m src.evaluate`. A saída fica em [results/metrics.csv](results/metrics.csv).
+Reproduza com `python -m src.evaluate`. A saída fica em [results/](results/).
 
-### 5.1 Comparação dos modelos
+### 5.1 Recomendação para clubes (teste: 2025/26)
 
-| Modelo | Precision@10 | Recall@10 | NDCG@10 | RMSE | Cobertura |
+| Modelo | Precision@20 | Recall@20 | NDCG@20 | HitRate@20 | Cobertura |
 |---|---:|---:|---:|---:|---:|
-| Popularidade (baseline) | 0,124 | 0,103 | 0,168 | 0,946 | 1,8% |
-| **Item-KNN** | **0,205** | 0,193 | **0,269** | 0,908 | **22,4%** |
-| **SVD** | 0,196 | **0,208** | 0,262 | **0,859** | 18,3% |
+| Aleatório (média de 20 sorteios) | 0,0018 | 0,011 | 0,0056 | 3,5% | 78% |
+| Popularidade (baseline) | 0,0009 | 0,003 | 0,0016 | 0,9% | 1,7% |
+| Item-KNN | 0,0064 | **0,064** | 0,0211 | 11,9% | **63%** |
+| SVD | 0,0055 | 0,047 | 0,0218 | 10,1% | 35% |
+| Conteúdo | 0,0046 | 0,029 | 0,0126 | 9,2% | 39% |
+| **Híbrido** | **0,0073** | 0,056 | **0,0245** | **12,8%** | 51% |
 
-- Os dois modelos de filtragem colaborativa superam o baseline em todas as métricas: **+65% de Precision** e **+60% de NDCG** (Item-KNN), e **+100% de Recall** (SVD).
-- **Item-KNN** teve o melhor ranking no topo (Precision e NDCG) e a maior cobertura: recomenda 12× mais filmes diferentes que o baseline.
-- **SVD** teve o melhor Recall e a melhor previsão de notas (RMSE 0,859).
-- O baseline de popularidade é forte (Precision 0,12). Filmes populares são populares porque muita gente gosta deles. Mesmo assim ele recomenda os mesmos 10 filmes para todos (cobertura de 1,8%).
+- **Os números absolutos são baixos, e isso é esperado.** Cada clube contratou em média 3 jogadores de um universo de 1.451, e contratações dependem de preço, agente e vontade do jogador, que não estão nos dados. O que importa é a comparação com as referências.
+- **A filtragem colaborativa acerta 3,5 a 4,5 vezes mais que o acaso:** o Híbrido tem NDCG 4,4× o aleatório e HitRate 3,6×. As "rotas de transferência" existem e são aprendíveis: o Rennes compra da Ligue 1, a Fiorentina e a Cremonese do mercado italiano.
+- **Popularidade é pior que o acaso.** Recomendar Yamal, Mbappé e Haaland para todos os clubes quase nunca acerta. Esse baseline ruim é, por si só, um achado: no scouting, "o melhor jogador" não é a recomendação certa para cada clube.
+- **O Híbrido foi o melhor em Precision, NDCG e HitRate, e o Item-KNN no Recall.** A diferença entre os dois é pequena (14 × 13 clubes com acerto) e, com 109 clubes, não é estatisticamente conclusiva.
+- **O conteúdo sozinho tem HitRate 2,6× o do acaso.** Clubes tendem a contratar jogadores com perfil estatístico parecido com o dos que já tiveram, mas esse sinal é mais fraco que o das redes de transferência.
 
-### 5.2 Análise: ranquear pela nota prevista
+**Honestidade sobre a validação:** na janela de validação, o Híbrido com α = 0,75 (NDCG 0,029) ficou **abaixo** do Item-KNN puro (0,038). O α = 0,75 foi o melhor entre as misturas de verdade (α < 1). Além disso, a validação favorece o conteúdo: as métricas FBref de 2024/25 dos jogadores contratados em 2024 já refletem o estilo do clube novo, um vazamento que não existe no teste. Isso pesou contra a mistura e mesmo assim não se refletiu no teste. Com os dados de 2023/24, a validação seria limpa.
 
-| Modelo | Precision@10 | Recall@10 | NDCG@10 | Cobertura |
-|---|---:|---:|---:|---:|
-| Item-KNN (rank por nota prevista) | 0,006 | 0,004 | 0,008 | 61,4% |
-| SVD (rank por nota prevista) | 0,103 | 0,091 | 0,145 | 7,5% |
+### 5.2 Validação do KNN por métricas
 
-Ranquear pela nota prevista (o que minimiza o RMSE) derruba a qualidade do top-N. No Item-KNN o ranking fica praticamente inútil: ele recomenda filmes obscuros com 1–2 vizinhos e previsão alta. Isso mostra que **um RMSE baixo não garante boas recomendações** e justifica usar métricas de ranking.
+Sem informar a posição, **70% dos 10 vizinhos de cada jogador são do mesmo grupo de posição** (o acaso daria 18%) e **55% são da mesma sub-posição** (acaso: 13%). As métricas "descobrem" a posição sozinhas.
 
-### 5.3 Exemplos para cinco usuários
+Por grupo: zagueiros 90%, centroavantes 79%, laterais 69%, pontas 66%, meias 58% e **volantes 45%**. Volantes se confundem com meias e zagueiros, o que é esperado e justifica os **pesos por posição**.
 
-Tabelas completas (histórico + top-10 dos 3 modelos, com ✅ nos acertos) em [results/examples.md](results/examples.md).
+Exemplos (grupo e pesos padrão):
 
-| Usuário | Perfil | Acertos no top-10 (Pop / KNN / SVD) | Observação |
+| Referência | 3 mais similares |
+|---|---|
+| Martín Zubimendi (VOL) | Enzo Barrenechea, Marten de Roon, Milan Badelj |
+| Erling Haaland (ATA) | Patrik Schick, Ermedin Demirović, Moise Kean |
+| Lamine Yamal (PON) | Michael Olise, Désiré Doué, Bukayo Saka |
+| Declan Rice (MEI) | Joan Jordán, Nicolò Fagioli, Răzvan Marin |
+
+### 5.3 Exemplos para cinco clubes
+
+Tabelas completas (histórico, top-20 de 3 modelos e ✅ nos acertos) em [results/examples.md](results/examples.md). Os 4 primeiros são os clubes com mais acertos do Híbrido; o Arsenal entra como contraexemplo.
+
+| Clube | Contratações reais (amostra) | Acertos top-20 (Pop / KNN / Híbrido) | Observação |
 |---|---|---|---|
-| 1 | 179 aval.; gosta de *Seven*, *Usual Suspects* | 3 / **6** / 3 | KNN acerta *Star Wars*, *Terminator*, *Back to the Future*, *Roger Rabbit* |
-| 15 | 107 aval.; *Star Wars*, *Aliens*, *T2* | 3 / 3 / **4** | SVD e KNN recomendam as sequências de *Star Wars* e *LOTR* |
-| 68 | 929 aval.; *Star Wars*, *Princess Bride* | 4 / **5** / 4 | SVD traz títulos menos óbvios (*Clueless*, *8 Mile*) e acerta |
-| 414 | 1.648 aval.; usuário muito ativo | **10 / 10** / 6 | O SVD fica mais "de nicho" (*Pianist*, *City of God*), mas continua relevante |
-| 599 | 1.316 aval.; *Ghost in the Shell*, *Dr. Strangelove* | 1 / **2** / 1 | Gosto pouco convencional; é o caso mais difícil para todos |
-| 🆕 novo | sem histórico | — | **Cold start:** mostra os populares. Depois de avaliar *Toy Story* com 5, o 1º recomendado vira *Toy Story 2* |
+| Stade Rennais | Rongier, Mahdi Camara, Embolo, Merlin | 0 / 1 / **2** | Rongier (Marseille) e Camara (Brest): mercado francês |
+| Fiorentina | Piccoli, Nicolussi Caviglia, Fazzini | 0 / 1 / **2** | Piccoli (Cagliari) no 11º lugar do Híbrido |
+| Cremonese | Thorsby, Pezzella, Vardy, Sanabria | 0 / 1 / 1 | promovida: vive do mercado italiano de meio de tabela |
+| Nottingham Forest | Bakwa, Ndoye, Kalimuendo, Savona | 0 / 0 / 1 | Bakwa (Strasbourg) no 15º lugar do Híbrido |
+| Arsenal | Zubimendi, Eze, Madueke, Hincapié | 0 / 0 / 0 | clubes de elite contratam "o melhor disponível", não seguem rotas |
+| 🆕 Clube novo | — | — | **Cold start:** mostra Yamal, Mbappé, Haaland (popularidade). Ao pôr Zubimendi na shortlist, passa a recomendar jogadores dos clubes por onde ele passou |
 
 ## 6. Interface (Streamlit)
 
@@ -137,30 +211,51 @@ Tabelas completas (histórico + top-10 dos 3 modelos, com ✅ nos acertos) em [r
 streamlit run app.py
 ```
 
-- **Barra lateral:** escolha do modelo (Popularidade / Item-KNN / SVD), do nº de recomendações e do usuário (inclui **"Novo usuário (sem histórico)"**).
-- **Histórico e recomendações:** histórico do usuário com as notas, recomendações com nota prevista e, no Item-KNN, a **explicação** ("porque você avaliou X"). Há também um formulário para **avaliar filmes**. A avaliação é salva em `data/user_ratings.csv` e as recomendações se atualizam na hora (fold-in).
-- **Dataset:** estatísticas e gráficos da exploração.
-- **Avaliação:** tabela e gráfico das métricas, os exemplos dos 5 usuários e um botão para rodar a avaliação de novo.
+1. **🔎 Jogadores similares:**
+   - escolha do jogador de referência e do grupo de comparação;
+   - filtros (liga, idade, valor máximo, minutos mínimos, top X% em métricas, excluir o próprio clube);
+   - sliders de peso, distância euclidiana ou cosseno, ajuste por liga e z-score por liga;
+   - ranking com similaridade %;
+   - **radar Plotly** em percentis do grupo (referência × até 2 similares), com os pontos em que os jogadores mais se parecem e mais diferem;
+   - **mapa PCA 2D** do grupo.
+2. **🏟️ Recomendação para clube:**
+   - escolha do clube ou de "🆕 Novo clube" e do modelo, com filtros;
+   - **histórico** (jogadores que atuaram pelo clube, com peso);
+   - recomendações com a explicação "por quê" (jogadores do histórico que levaram à recomendação);
+   - **shortlist** com interesse de 1 a 5, que entra na hora (*fold-in*), é salva em `data/shortlists.csv` e remove o jogador das recomendações.
+3. **📊 Dataset:** cobertura, cruzamento, distribuições.
+4. **🧪 Avaliação:** métricas, gráficos, validação de posição e exemplos.
+
+A interface usa todos os dados até jul/2026. A avaliação usa o corte de 01/07/2025.
 
 ## 7. Limitações
 
-- **Cold start:** usuários sem histórico recebem só recomendações populares, e **filmes novos** (menos de 5 avaliações) nunca são recomendados.
-- **Viés de popularidade:** mesmo os modelos de FC tendem a recomendar filmes muito avaliados. A cobertura máxima foi de 22% do catálogo.
-- **Dataset pequeno e antigo:** 610 usuários, avaliações de 1996–2018, e usuários do MovieLens não representam o público em geral.
-- **Avaliação offline:** um filme recomendado que não está no teste conta como erro, mas o usuário talvez gostasse dele sem ainda tê-lo visto. As métricas são, portanto, estimativas pessimistas. O ideal seria um teste A/B com usuários reais.
-- **Divisão aleatória** (e não temporal): o modelo pode "ver o futuro" do usuário.
-- **Hiperparâmetros** (k = 50 vizinhos, 50 fatores, limiar ≥ 4) escolhidos com poucos testes e sem conjunto de validação separado.
-- **Sem informação de conteúdo:** gêneros, sinopses e elenco não são usados. Um modelo híbrido ajudaria no cold start de itens.
+- **Só as 5 grandes ligas e só 2024/25** no conteúdo (limite do dataset e do fim dos dados Opta no FBref). Contratações vindas de outras ligas (Portugal, Holanda, Brasil) não podem ser recomendadas: só cerca de 24% das chegadas aos clubes das 5 grandes ligas vieram do universo scoutável.
+- **Métricas de uma única temporada**, sem tendência nem histórico de lesões.
+- **Sem ajuste por posse de bola.** Times com pouca posse inflam métricas defensivas. O FBref não traz a posse do time no CSV de jogadores.
+- **Cruzamento por nome** (99,7%): poucos erros possíveis entre homônimos da base.
+- **Matriz muito esparsa** (99,8%), porque cada jogador passa por poucos clubes. Jogadores de clubes com "exércitos de empréstimo" (ex.: Chelsea) têm muitas co-ocorrências e aparecem mais.
+- **O fator de liga pelo coeficiente UEFA** mede o desempenho dos clubes na Europa, não o nível médio de cada jogador. É uma aproximação.
+- **Contratações dependem de fatores fora dos dados** (preço, salário, agente, vontade do jogador), e 109 clubes de teste dão pouca confiança estatística nas diferenças entre modelos.
+- **Validação com vazamento parcial** no modelo de conteúdo (ver 5.1).
 
 ## 8. Conclusão
 
-A filtragem colaborativa funciona bem mesmo com uma matriz 96% vazia: Item-KNN e SVD ficaram **~60% a ~100% acima do baseline** em todas as métricas de ranking e recomendaram um catálogo muito mais diverso. O Item-KNN é simples, rápido e **explicável** ("porque você viu X"), o que ajuda na interface. O SVD prevê melhor as notas e encontra títulos menos óbvios. O principal aprendizado da análise é que **otimizar a previsão de nota (RMSE) não é o mesmo que recomendar bem**: métricas de ranking como Precision, Recall e NDCG são mais adequadas ao problema. Como trabalhos futuros, ficam a combinação dos dois modelos (híbrido), o uso de gêneros para o cold start e uma divisão temporal na avaliação.
+É possível levar um recomendador de filmes para o scouting mantendo a filtragem colaborativa, desde que se encontre a "interação" certa: **clube × jogador**. As redes de transferência são reais e aprendíveis. A CF acerta 3,5 a 4,5 vezes mais que o acaso na tarefa, bem difícil, de prever as contratações da temporada seguinte, enquanto recomendar os mais valorizados é pior que sortear.
+
+A camada de conteúdo resolve o que a CF não resolve: o cold start (buscar por um jogador de referência) e a pergunta típica do olheiro ("quem joga como X?"), com um KNN que **recupera a posição dos jogadores em 70% dos casos sem saber a posição**. A combinação das duas, mais os filtros de decisão, é o que um departamento de scouting usaria.
+
+Trabalhos futuros:
+- incluir mais temporadas (validação sem vazamento, tendência de evolução);
+- incluir mais ligas (Brasileirão, Portugal) e ajuste por posse;
+- incluir valor e salário como restrição de orçamento;
+- usar o ranking como triagem para vídeo.
 
 ---
 
 ## Como executar
 
-Requisitos: **Python 3.10+** e internet na primeira execução (download de cerca de 1 MB).
+Requisitos: **Python 3.10+** e internet na primeira execução (download de cerca de 240 MB via `kagglehub`, sem login).
 
 ```bash
 git clone <url-do-repositorio>
@@ -174,28 +269,33 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 
-python -m src.evaluate      # baixa os dados, avalia os modelos e gera results/
-streamlit run app.py        # abre a interface em http://localhost:8501
+python -m src.evaluate          # baixa os dados, cruza as bases, avalia e gera results/
+streamlit run app.py            # abre a interface em http://localhost:8501
+python -m src.evaluate --tune   # (opcional) busca de hiperparâmetros na validação
 ```
+
+Se o `kagglehub` não funcionar, baixe os dois datasets manualmente no Kaggle e extraia em `data/raw/football-players-stats-2024-2025/` e `data/raw/player-scores/`.
 
 ## Estrutura
 
 ```
 ├── app.py               # interface Streamlit
 ├── src/
-│   ├── data.py          # download, preparação, matriz usuário×item
-│   ├── models.py        # Popularidade, Item-KNN, SVD
-│   └── evaluate.py      # divisão treino/teste, métricas, exemplos
-├── results/
-│   ├── metrics.csv      # métricas geradas pela avaliação
-│   └── examples.md      # recomendações para 5 usuários de teste
-├── data/raw/            # dataset (baixado automaticamente, fora do git)
+│   ├── config.py        # posições, métricas, pesos, fatores de liga, datas
+│   ├── data.py          # download, FBref, Transfermarkt, matriz clube × jogador, shortlist
+│   ├── matching.py      # cruzamento FBref ↔ Transfermarkt
+│   ├── features.py      # por 90, encolhimento, z-score por posição, pesos
+│   ├── scouting.py      # ScoutFilter (decisão) + KNN de jogadores similares
+│   ├── models.py        # Popularidade, Item-KNN, SVD, Conteúdo, Híbrido
+│   └── evaluate.py      # divisão temporal, métricas, exemplos, validação
+├── results/             # métricas e exemplos gerados pela avaliação
 └── requirements.txt
 ```
 
 ## Referências
 
-- Harper, F. M.; Konstan, J. A. *The MovieLens Datasets: History and Context*. ACM TiiS, 2015.
 - Sarwar, B. et al. *Item-based Collaborative Filtering Recommendation Algorithms*. WWW, 2001.
+- Hu, Y.; Koren, Y.; Volinsky, C. *Collaborative Filtering for Implicit Feedback Datasets*. ICDM, 2008.
 - Cremonesi, P.; Koren, Y.; Turrin, R. *Performance of Recommender Algorithms on Top-N Recommendation Tasks*. RecSys, 2010.
-- Koren, Y.; Bell, R.; Volinsky, C. *Matrix Factorization Techniques for Recommender Systems*. IEEE Computer, 2009.
+- Burke, R. *Hybrid Recommender Systems: Survey and Experiments*. UMUAI, 2002.
+- Sports Reference. *FBref & Stathead Data Update*, jan/2026.
